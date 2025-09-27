@@ -70,4 +70,4 @@ temp/
 !samples/*.docx
 !samples/*.doc
 !tests/fixtures/*.docx
-!tests/fixtures/*.doc
+!tests/fixtures/*.docsmoking_protocol.md
