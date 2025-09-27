@@ -130,45 +130,151 @@ export class WordParser {
   }
 
   private extractText(parsedDoc: any): string {
-    const texts: string[] = [];
+    const textParts: string[] = [];
 
-    const extractFromNode = (node: any) => {
-      if (typeof node === 'string') {
-        texts.push(node);
+    const extractTextFromElement = (element: any) => {
+      if (!element) return;
+
+      // Handle text content directly - this is the actual readable text
+      if (typeof element === 'string') {
+        const cleanText = element.trim();
+        if (cleanText && !cleanText.includes('http://schemas.microsoft.com')) {
+          textParts.push(cleanText);
+        }
         return;
       }
 
-      if (Array.isArray(node)) {
-        node.forEach(extractFromNode);
+      // Handle arrays
+      if (Array.isArray(element)) {
+        element.forEach(item => extractTextFromElement(item));
         return;
       }
 
-      if (typeof node === 'object' && node !== null) {
-        // Handle text nodes
-        if (node['w:t']) {
-          const textContent = Array.isArray(node['w:t']) ? node['w:t'].join('') : node['w:t'];
-          texts.push(textContent);
+      // Handle objects
+      if (typeof element === 'object') {
+        // Text content - the actual readable text in Word documents
+        if (element['w:t']) {
+          let text = '';
+          
+          // Handle direct text content
+          if (typeof element['w:t'] === 'string') {
+            text = element['w:t'];
+          } else if (element['w:t'] && typeof element['w:t'] === 'object' && element['w:t']['_']) {
+            // Handle complex text objects with underscore property
+            text = element['w:t']['_'];
+          } else if (element['w:t'] && typeof element['w:t'] === 'object' && element['w:t']['$']) {
+            // Handle text with attributes
+            text = element['w:t']['$']['xml:space'] === 'preserve' ? element['w:t']['_'] || '' : '';
+          }
+          
+          // Only add meaningful text (not XML garbage)
+          if (text && typeof text === 'string' && text.trim() && !text.includes('http://schemas')) {
+            textParts.push(text);
+          }
+          return;
         }
 
-        // Handle paragraphs and runs
-        if (node['w:p']) {
-          const paragraphs = Array.isArray(node['w:p']) ? node['w:p'] : [node['w:p']];
-          paragraphs.forEach(extractFromNode);
-          texts.push('\n');
+        // Paragraph break
+        if (element['w:p']) {
+          if (textParts.length > 0 && !textParts[textParts.length - 1].endsWith('\n')) {
+            textParts.push('\n\n');
+          }
+          extractTextFromElement(element['w:p']);
+          return;
         }
 
-        if (node['w:r']) {
-          const runs = Array.isArray(node['w:r']) ? node['w:r'] : [node['w:r']];
-          runs.forEach(extractFromNode);
+        // Run (text formatting container)
+        if (element['w:r']) {
+          extractTextFromElement(element['w:r']);
+          return;
         }
 
-        // Recursively process other nodes
-        Object.values(node).forEach(extractFromNode);
+        // Tab character
+        if (element['w:tab']) {
+          textParts.push('\t');
+          return;
+        }
+
+        // Line break
+        if (element['w:br']) {
+          textParts.push('\n');
+          return;
+        }
+
+        // Document structure elements
+        if (element['w:document']) {
+          extractTextFromElement(element['w:document']);
+          return;
+        }
+
+        if (element['w:body']) {
+          extractTextFromElement(element['w:body']);
+          return;
+        }
+
+        // Recursively process other Word elements, but avoid formatting/style elements
+        for (const [key, value] of Object.entries(element)) {
+          if (key.startsWith('w:') && 
+              !key.includes('Pr') && 
+              !key.includes('Style') && 
+              !key.includes('Properties') &&
+              !key.includes('Fonts') &&
+              !key.includes('Settings') &&
+              key !== 'w:t') {
+            extractTextFromElement(value);
+          }
+        }
       }
     };
 
-    extractFromNode(parsedDoc);
-    return texts.join('').replace(/\n+/g, '\n').trim();
+    extractTextFromElement(parsedDoc);
+    
+    // Clean up and format the extracted text
+    let finalText = textParts
+      .join(' ')  // Join with spaces instead of empty string
+      .replace(/\n{3,}/g, '\n\n')     // Max 2 consecutive newlines
+      .replace(/[ \t]+/g, ' ')        // Multiple spaces/tabs to single space
+      .replace(/\n /g, '\n')          // Remove spaces after newlines
+      .replace(/([a-z])([A-Z])/g, '$1 $2')  // Add space between camelCase words
+      .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')  // Add space between consecutive caps
+      .replace(/([0-9])([A-Z])/g, '$1 $2')  // Add space between numbers and caps
+      .replace(/([a-z])([0-9])/g, '$1 $2')  // Add space between lowercase and numbers
+      .replace(/[0-9A-F]{8,}/g, '')   // Remove hex codes (8+ hex chars)
+      .replace(/\s+/g, ' ')           // Normalize whitespace
+      .trim();
+
+    // If we got no meaningful text, try a fallback approach
+    if (!finalText || finalText.length < 10) {
+      // Fallback: extract any readable text from the document
+      const fallbackText = this.extractTextFallback(parsedDoc);
+      if (fallbackText && fallbackText.length > finalText.length) {
+        finalText = fallbackText;
+      }
+    }
+
+    return finalText;
+  }
+
+  private extractTextFallback(obj: any): string {
+    const textParts: string[] = [];
+    
+    const findText = (element: any) => {
+      if (typeof element === 'string' && element.trim() && !element.includes('http://schemas')) {
+        textParts.push(element.trim());
+      } else if (Array.isArray(element)) {
+        element.forEach(findText);
+      } else if (element && typeof element === 'object') {
+        Object.values(element).forEach(findText);
+      }
+    };
+    
+    findText(obj);
+    
+    return textParts
+      .filter(text => text.length > 2 && !/^[0-9]+$/.test(text)) // Filter out single chars and pure numbers
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   private async extractMetadata(docxContent: Record<string, string>): Promise<DocumentMetadata> {
@@ -261,11 +367,38 @@ export class WordParser {
       markdown += `**Author:** ${metadata.author}\n\n`;
     }
 
-    // Simple paragraph conversion
-    const paragraphs = content.split('\n').filter(p => p.trim());
-    markdown += paragraphs.join('\n\n');
+    // Better paragraph detection and formatting
+    const sentences = content.split(/(?<=[.!?])\s+/);
+    let currentParagraph = '';
+    
+    for (const sentence of sentences) {
+      const cleanSentence = sentence.trim();
+      if (!cleanSentence) continue;
+      
+      // If this looks like a header (starts with capital and is short)
+      if (cleanSentence.length < 50 && /^[A-Z][a-z]*\s*[A-Z]/.test(cleanSentence)) {
+        if (currentParagraph) {
+          markdown += currentParagraph.trim() + '\n\n';
+          currentParagraph = '';
+        }
+        markdown += `## ${cleanSentence}\n\n`;
+      } else {
+        currentParagraph += cleanSentence + ' ';
+        
+        // End paragraph if we have enough content
+        if (currentParagraph.length > 200) {
+          markdown += currentParagraph.trim() + '\n\n';
+          currentParagraph = '';
+        }
+      }
+    }
+    
+    // Add any remaining content
+    if (currentParagraph.trim()) {
+      markdown += currentParagraph.trim() + '\n\n';
+    }
 
-    return markdown;
+    return markdown.trim();
   }
 
   private convertToHtml(content: string, metadata?: DocumentMetadata): string {
